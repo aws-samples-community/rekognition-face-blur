@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import urllib
 
@@ -8,8 +7,11 @@ import botocore
 import cv2
 import numpy as np
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+from aws_lambda_powertools import Logger
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from aws_lambda_powertools.utilities.data_classes import event_source, S3Event
+
+logger = Logger()
 
 rekognition = boto3.client('rekognition')
 s3 = boto3.client('s3')
@@ -96,81 +98,55 @@ def anonymize_face_pixelate(image, blocks=10):
     return image
 
 
-def lambda_handler(event, context):
-    successful_records = []
-    failed_records = []
+@logger.inject_lambda_context(log_event=True)
+@event_source(data_class=S3Event)
+def lambda_handler(event: S3Event, context: LambdaContext) -> dict:
+    logger.debug("S3 event: {}", event=event)
 
-    for record in event['Records']:
-
-        # verify event has reference to S3 object
+    for record in event.records:
         try:
-            # get metadata of file uploaded to Amazon S3
-            bucket = record['s3']['bucket']['name']
-            key = urllib.parse.unquote_plus(record['s3']['object']['key'])
-            size = int(record['s3']['object']['size'])
-            filename = key.split('/')[-1]
-            local_filename = '/tmp/{}'.format(filename)
+            bucket: str = record.s3.bucket.name
+            key: str = urllib.parse.unquote_plus(record.s3.get_object.key)
+            filename: str = key.split('/')[-1]
+            local_filename: str = f"/tmp/{filename}"
         except KeyError:
-            error_message = 'Lambda invoked without S3 event data. Event needs to reference a S3 bucket and object key.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
+            logger.error("Unable to retrieve S3 object metadata")
 
-        # verify file size is < 15MB
-        if size > 15728640:
-            error_message = 'Maximum image size stored as an Amazon S3 object is limited to 15 MB for Amazon Rekognition.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
-
-        # verify file is JPEG or PNG
         if local_filename.split('.')[-1] not in ['png', 'jpeg', 'jpg']:
-            error_message = 'Unsupported file type. Amazon Rekognition Image currently supports the JPEG and PNG image formats.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
+            logger.error("File extension is not supported")
 
         # download file locally to /tmp retrieve metadata
         try:
             s3.download_file(bucket, key, local_filename)
         except botocore.exceptions.ClientError:
-            error_message = 'Lambda role does not have permission to call GetObject for the input S3 bucket, or object does not exist.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
+            logger.error("Lack of permissions to download file from S3")
 
         image = cv2.imread(local_filename)
-        image_height, image_width, channels = image.shape
+        image_height: int
+        image_width: int
+        image_height, image_width, _ = image.shape
 
-        # use Amazon Rekognition to detect faces in image uploaded to Amazon S3
         try:
             response = rekognition.detect_faces(Image={"S3Object": {"Bucket": bucket, "Name": key}})
-
         except rekognition.exceptions.AccessDeniedException:
-
-            error_message = 'Lambda role does not have permission to call DetectFaces in Amazon Rekognition.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
-
+            logger.error("Lack of permissions to access Amazon Rekognition")
         except rekognition.exceptions.InvalidS3ObjectException:
+            logger.error("S3 object does not exist")
 
-            error_message = 'Unable to get object metadata from S3. Check object key, region and/or access permissions for input S3 bucket.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
-
-        # loop through faces detected by Amazon Rekognition
         for detected_face in response['FaceDetails']:
-
-            # calcuate bounding box values
             x1 = int(detected_face['BoundingBox']['Left'] * image_width)
             x2 = x1 + int(detected_face['BoundingBox']['Width'] * image_width)
             y1 = int(detected_face['BoundingBox']['Top'] * image_height)
             y2 = y1 + int(detected_face['BoundingBox']['Height'] * image_height)
 
             # extract the face ROI
-            face = image[y1:y2, x1:x2]
+            face_roi = image[y1:y2, x1:x2]
 
             # anonymize/blur faces
             if os.environ['BLUR_TYPE'] == 'pixelate':
-                face = anonymize_face_pixelate(face, blocks=10)
+                face = anonymize_face_pixelate(face_roi, blocks=10)
             else:
-                face = anonymize_face_simple(face, factor=3.0)
+                face = anonymize_face_simple(face_roi, factor=3.0)
 
             # store the blurred face in the output image
             image[y1:y2, x1:x2] = face
@@ -182,34 +158,18 @@ def lambda_handler(event, context):
         try:
             s3.upload_file(local_filename, output_bucket, key)
         except boto3.exceptions.S3UploadFailedError:
-            error_message = 'Lambda role does not have permission to call PutObject for the output S3 bucket.'
-            add_failed(bucket, error_message, failed_records, key)
-            continue
+            logger.error("Lack of permissions to upload file to S3")
 
         # clean up /tmp
         if os.path.exists(local_filename):
             os.remove(local_filename)
-
-        successful_records.append({
-            "bucket": bucket,
-            "key": key
-        })
 
     return {
         "statusCode": 200,
         "body": json.dumps(
             {
                 "cv2_version": cv2.__version__,
-                "failed_records": failed_records,
-                "successful_records": successful_records
+                "message": "blur_faces lambda function executed successfully!"
             }
         )
     }
-
-
-def add_failed(bucket, error_message, failed_records, key):
-    failed_records.append({
-        "bucket": bucket,
-        "key": key,
-        "error_message": error_message
-    })

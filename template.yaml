@@ -9,6 +9,11 @@ Description: >
 Globals:
   Function:
     Timeout: 3
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: blur-faces
+        POWERTOOLS_LOG_LEVEL: INFO
 
 Resources:
   BlurFacesFunction:
